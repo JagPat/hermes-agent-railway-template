@@ -20,9 +20,15 @@ from starlette.authentication import (
 from starlette.middleware import Middleware
 from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
-from starlette.routing import Route
+from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from starlette.routing import Route, Mount
 from starlette.templating import Jinja2Templates
+
+try:
+    import aiohttp
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    AIOHTTP_AVAILABLE = False
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -39,6 +45,10 @@ HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 ENV_FILE_PATH = Path(HERMES_HOME) / ".env"
 PAIRING_DIR = Path(HERMES_HOME) / "pairing"
 CODE_TTL_SECONDS = 3600
+
+API_SERVER_HOST = os.environ.get("API_SERVER_HOST", "127.0.0.1")
+API_SERVER_PORT = os.environ.get("API_SERVER_PORT", "8642")
+API_SERVER_TARGET = f"http://{API_SERVER_HOST}:{API_SERVER_PORT}"
 
 # Registry of known Hermes env vars exposed in the UI.
 # Each entry: (key, label, category, is_password)
@@ -63,30 +73,30 @@ ENV_VAR_DEFS = [
     ("GITHUB_TOKEN", "GitHub Token", "tool", True),
     ("VOICE_TOOLS_OPENAI_KEY", "OpenAI Voice Key", "tool", True),
     ("HONCHO_API_KEY", "Honcho API Key", "tool", True),
-    # Messaging — Telegram
+    # Messaging â Telegram
     ("TELEGRAM_BOT_TOKEN", "Telegram Bot Token", "messaging", True),
     ("TELEGRAM_ALLOWED_USERS", "Telegram Allowed Users", "messaging", False),
-    # Messaging — Discord
+    # Messaging â Discord
     ("DISCORD_BOT_TOKEN", "Discord Bot Token", "messaging", True),
     ("DISCORD_ALLOWED_USERS", "Discord Allowed Users", "messaging", False),
-    # Messaging — Slack
+    # Messaging â Slack
     ("SLACK_BOT_TOKEN", "Slack Bot Token", "messaging", True),
     ("SLACK_APP_TOKEN", "Slack App Token", "messaging", True),
-    # Messaging — WhatsApp
+    # Messaging â WhatsApp
     ("WHATSAPP_ENABLED", "WhatsApp Enabled", "messaging", False),
-    # Messaging — Email
+    # Messaging â Email
     ("EMAIL_ADDRESS", "Email Address", "messaging", False),
     ("EMAIL_PASSWORD", "Email Password", "messaging", True),
     ("EMAIL_IMAP_HOST", "Email IMAP Host", "messaging", False),
     ("EMAIL_SMTP_HOST", "Email SMTP Host", "messaging", False),
-    # Messaging — Mattermost
+    # Messaging â Mattermost
     ("MATTERMOST_URL", "Mattermost URL", "messaging", False),
     ("MATTERMOST_TOKEN", "Mattermost Token", "messaging", True),
-    # Messaging — Matrix
+    # Messaging â Matrix
     ("MATRIX_HOMESERVER", "Matrix Homeserver", "messaging", False),
     ("MATRIX_ACCESS_TOKEN", "Matrix Access Token", "messaging", True),
     ("MATRIX_USER_ID", "Matrix User ID", "messaging", False),
-    # Messaging — General
+    # Messaging â General
     ("GATEWAY_ALLOW_ALL_USERS", "Allow All Users", "messaging", False),
 ]
 
@@ -180,6 +190,10 @@ def merge_secrets(new_vars: dict[str, str], existing_vars: dict[str, str]) -> di
 
 class BasicAuthBackend(AuthenticationBackend):
     async def authenticate(self, conn):
+        # Skip basic auth for /v1/* routes â they use Bearer token auth via Hermes API server
+        if conn.url.path.startswith("/v1/"):
+            return AuthCredentials(["authenticated"]), SimpleUser("api_client")
+
         if "Authorization" not in conn.headers:
             return None
 
@@ -207,6 +221,111 @@ def require_auth(request: Request):
             headers={"WWW-Authenticate": 'Basic realm="hermes"'},
         )
     return None
+
+
+# âââ /v1/* Reverse Proxy to Hermes API Server âââââââââââââââââââââââ
+
+_proxy_session: aiohttp.ClientSession | None = None if AIOHTTP_AVAILABLE else None
+
+
+async def _get_proxy_session() -> "aiohttp.ClientSession":
+    global _proxy_session
+    if _proxy_session is None or _proxy_session.closed:
+        timeout = aiohttp.ClientTimeout(total=300)  # 5 min for long agent responses
+        _proxy_session = aiohttp.ClientSession(timeout=timeout)
+    return _proxy_session
+
+
+async def _close_proxy_session():
+    global _proxy_session
+    if _proxy_session and not _proxy_session.closed:
+        await _proxy_session.close()
+        _proxy_session = None
+
+
+async def v1_proxy(request: Request):
+    """Reverse-proxy /v1/* requests to the internal Hermes API server.
+    No basic auth required â Hermes uses its own API_SERVER_KEY Bearer auth."""
+    if not AIOHTTP_AVAILABLE:
+        return JSONResponse(
+            {"error": "aiohttp not installed â proxy unavailable"},
+            status_code=503,
+        )
+
+    path = request.url.path
+    target_url = f"{API_SERVER_TARGET}{path}"
+    if request.url.query:
+        target_url += f"?{request.url.query}"
+
+    # Forward relevant headers (Authorization, Content-Type, etc.)
+    forward_headers = {}
+    for key in ("authorization", "content-type", "accept", "x-hermes-session-id"):
+        val = request.headers.get(key)
+        if val:
+            forward_headers[key] = val
+
+    body = await request.body()
+
+    try:
+        session = await _get_proxy_session()
+        resp = await session.request(
+            method=request.method,
+            url=target_url,
+            headers=forward_headers,
+            data=body if body else None,
+        )
+
+        # Check if this is a streaming response (SSE)
+        content_type = resp.headers.get("content-type", "")
+        if "text/event-stream" in content_type:
+            # Stream the response back
+            async def stream_generator():
+                try:
+                    async for chunk in resp.content.iter_any():
+                        yield chunk
+                finally:
+                    resp.release()
+
+            return StreamingResponse(
+                stream_generator(),
+                status_code=resp.status,
+                headers={
+                    "content-type": content_type,
+                    "cache-control": "no-cache",
+                },
+            )
+        else:
+            # Non-streaming: read full response and return
+            resp_body = await resp.read()
+            resp_headers = {
+                k: v for k, v in resp.headers.items()
+                if k.lower() not in ("transfer-encoding", "content-encoding", "content-length")
+            }
+            resp.release()
+            return PlainTextResponse(
+                content=resp_body.decode("utf-8", errors="replace"),
+                status_code=resp.status,
+                headers=resp_headers,
+                media_type=content_type or "application/json",
+            )
+    except aiohttp.ClientConnectorError:
+        return JSONResponse(
+            {"error": "Hermes API server not reachable â gateway may still be starting"},
+            status_code=503,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            {"error": "Request to Hermes API server timed out"},
+            status_code=504,
+        )
+    except Exception as e:
+        return JSONResponse(
+            {"error": f"Proxy error: {type(e).__name__}: {e}"},
+            status_code=502,
+        )
+
+
+# âââ End Proxy âââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 
 class GatewayManager:
@@ -573,12 +692,15 @@ routes = [
     Route("/api/pairing/deny", api_pairing_deny, methods=["POST"]),
     Route("/api/pairing/approved", api_pairing_approved),
     Route("/api/pairing/revoke", api_pairing_revoke, methods=["POST"]),
+    # Reverse proxy: /v1/* â Hermes API server (no basic auth â uses Bearer token)
+    Route("/v1/{path:path}", v1_proxy, methods=["GET", "POST", "PUT", "DELETE", "PATCH"]),
 ]
 
 @asynccontextmanager
 async def lifespan(app):
     await auto_start_gateway()
     yield
+    await _close_proxy_session()
     await gateway.stop()
 
 
