@@ -73,30 +73,30 @@ ENV_VAR_DEFS = [
     ("GITHUB_TOKEN", "GitHub Token", "tool", True),
     ("VOICE_TOOLS_OPENAI_KEY", "OpenAI Voice Key", "tool", True),
     ("HONCHO_API_KEY", "Honcho API Key", "tool", True),
-    # Messaging â Telegram
+    # Messaging Ã¢ÂÂ Telegram
     ("TELEGRAM_BOT_TOKEN", "Telegram Bot Token", "messaging", True),
     ("TELEGRAM_ALLOWED_USERS", "Telegram Allowed Users", "messaging", False),
-    # Messaging â Discord
+    # Messaging Ã¢ÂÂ Discord
     ("DISCORD_BOT_TOKEN", "Discord Bot Token", "messaging", True),
     ("DISCORD_ALLOWED_USERS", "Discord Allowed Users", "messaging", False),
-    # Messaging â Slack
+    # Messaging Ã¢ÂÂ Slack
     ("SLACK_BOT_TOKEN", "Slack Bot Token", "messaging", True),
     ("SLACK_APP_TOKEN", "Slack App Token", "messaging", True),
-    # Messaging â WhatsApp
+    # Messaging Ã¢ÂÂ WhatsApp
     ("WHATSAPP_ENABLED", "WhatsApp Enabled", "messaging", False),
-    # Messaging â Email
+    # Messaging Ã¢ÂÂ Email
     ("EMAIL_ADDRESS", "Email Address", "messaging", False),
     ("EMAIL_PASSWORD", "Email Password", "messaging", True),
     ("EMAIL_IMAP_HOST", "Email IMAP Host", "messaging", False),
     ("EMAIL_SMTP_HOST", "Email SMTP Host", "messaging", False),
-    # Messaging â Mattermost
+    # Messaging Ã¢ÂÂ Mattermost
     ("MATTERMOST_URL", "Mattermost URL", "messaging", False),
     ("MATTERMOST_TOKEN", "Mattermost Token", "messaging", True),
-    # Messaging â Matrix
+    # Messaging Ã¢ÂÂ Matrix
     ("MATRIX_HOMESERVER", "Matrix Homeserver", "messaging", False),
     ("MATRIX_ACCESS_TOKEN", "Matrix Access Token", "messaging", True),
     ("MATRIX_USER_ID", "Matrix User ID", "messaging", False),
-    # Messaging â General
+    # Messaging Ã¢ÂÂ General
     ("GATEWAY_ALLOW_ALL_USERS", "Allow All Users", "messaging", False),
 ]
 
@@ -190,8 +190,8 @@ def merge_secrets(new_vars: dict[str, str], existing_vars: dict[str, str]) -> di
 
 class BasicAuthBackend(AuthenticationBackend):
     async def authenticate(self, conn):
-        # Skip basic auth for /v1/* routes â they use Bearer token auth via Hermes API server
-        if conn.url.path.startswith("/v1/"):
+        # Skip basic auth for /v1/* routes Ã¢ÂÂ they use Bearer token auth via Hermes API server
+        if conn.url.path.startswith("/v1/") or conn.url.path.startswith("/paperclip/"):
             return AuthCredentials(["authenticated"]), SimpleUser("api_client")
 
         if "Authorization" not in conn.headers:
@@ -223,7 +223,153 @@ def require_auth(request: Request):
     return None
 
 
-# âââ /v1/* Reverse Proxy to Hermes API Server âââââââââââââââââââââââ
+# âââ Paperclip â Hermes Translation Layer âââââââââââââââââââââââââ
+# Accepts Paperclip HTTP adapter format, translates to OpenAI chat
+# completions, calls internal Hermes API server, returns result.
+
+API_SERVER_KEY = os.environ.get("API_SERVER_KEY", "")
+
+
+def _extract_messages_from_paperclip(body: dict) -> list[dict]:
+    """Extract or construct OpenAI messages array from Paperclip payload."""
+    # If Paperclip sends messages directly (future-proof)
+    if "messages" in body and isinstance(body["messages"], list):
+        return body["messages"]
+
+    # Extract from context object
+    ctx = body.get("context", {})
+    if isinstance(ctx, dict):
+        if "messages" in ctx and isinstance(ctx["messages"], list):
+            return ctx["messages"]
+
+        # Build from task fields
+        parts = []
+        task_title = ctx.get("taskTitle") or ctx.get("task_title") or ""
+        task_body = ctx.get("taskBody") or ctx.get("task_body") or ctx.get("description") or ""
+        instructions = ctx.get("instructions") or ctx.get("systemPrompt") or ""
+
+        if task_title or task_body:
+            content = ""
+            if task_title:
+                content += f"Task: {task_title}\n\n"
+            if task_body:
+                content += task_body
+            parts.append({"role": "user", "content": content.strip()})
+        elif ctx.get("prompt"):
+            parts.append({"role": "user", "content": ctx["prompt"]})
+
+        if instructions and parts:
+            parts.insert(0, {"role": "system", "content": instructions})
+
+        if parts:
+            return parts
+
+    # Last resort: dump the whole body as user message
+    fallback_content = json.dumps(body, indent=2, default=str)[:4000]
+    return [{"role": "user", "content": f"Process this request:\n{fallback_content}"}]
+
+
+async def paperclip_invoke(request: Request):
+    """Translation endpoint: Paperclip HTTP adapter -> Hermes chat completions."""
+    if not AIOHTTP_AVAILABLE:
+        return JSONResponse({"error": "aiohttp not installed"}, status_code=503)
+
+    try:
+        body = await request.json()
+    except Exception:
+        # Log raw body for debugging
+        raw = await request.body()
+        print(f"[paperclip-invoke] Bad JSON. Raw body: {raw[:500]}")
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    agent_id = body.get("agentId", "unknown")
+    run_id = body.get("runId", "unknown")
+    print(f"[paperclip-invoke] Received: agent={agent_id} run={run_id} keys={list(body.keys())}")
+    # Log full body for first-time debugging (remove later)
+    print(f"[paperclip-invoke] Full body: {json.dumps(body, default=str)[:2000]}")
+
+    messages = _extract_messages_from_paperclip(body)
+
+    # Read model from Hermes config
+    env_vars = read_env_file(ENV_FILE_PATH)
+    model = env_vars.get("LLM_MODEL") or os.environ.get("LLM_MODEL", "auto")
+
+    chat_request = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": 16384,
+    }
+
+    # Session support
+    session_id = None
+    ctx = body.get("context", {})
+    if isinstance(ctx, dict):
+        sp = ctx.get("sessionParams") or {}
+        session_id = sp.get("sessionId") if isinstance(sp, dict) else None
+
+    target_url = f"{API_SERVER_TARGET}/v1/chat/completions"
+    forward_headers = {"content-type": "application/json"}
+    if API_SERVER_KEY:
+        forward_headers["authorization"] = f"Bearer {API_SERVER_KEY}"
+    if session_id:
+        forward_headers["x-hermes-session-id"] = session_id
+
+    try:
+        session = await _get_proxy_session()
+        resp = await session.request(
+            method="POST", url=target_url,
+            headers=forward_headers, json=chat_request,
+        )
+        resp_body = await resp.read()
+        resp_data = json.loads(resp_body.decode("utf-8", errors="replace"))
+        resp.release()
+
+        if resp.status != 200:
+            err_msg = resp_data.get("error", {}).get("message", "Unknown") if isinstance(resp_data, dict) else str(resp_data)[:500]
+            print(f"[paperclip-invoke] Hermes error: {resp.status} {err_msg}")
+            return JSONResponse({
+                "exitCode": 1, "timedOut": False, "errorMessage": f"Hermes: {err_msg}",
+                "summary": err_msg, "resultJson": {"result": "", "session_id": ""},
+            })
+
+        choices = resp_data.get("choices", [])
+        assistant_msg = choices[0].get("message", {}).get("content", "") if choices else ""
+        usage = resp_data.get("usage", {})
+        input_tokens = usage.get("prompt_tokens", 0)
+        output_tokens = usage.get("completion_tokens", 0)
+        resp_session_id = session_id or f"hermes_{run_id}_{int(time.time())}"
+
+        result = {
+            "exitCode": 0, "signal": None, "timedOut": False,
+            "provider": "openrouter", "model": resp_data.get("model", model),
+            "summary": assistant_msg[:2000],
+            "resultJson": {
+                "result": assistant_msg,
+                "session_id": resp_session_id,
+                "usage": {"inputTokens": input_tokens, "outputTokens": output_tokens},
+                "cost_usd": 0,
+            },
+            "sessionParams": {"sessionId": resp_session_id},
+            "sessionDisplayId": resp_session_id[:16],
+            "usage": {"inputTokens": input_tokens, "outputTokens": output_tokens},
+        }
+
+        print(f"[paperclip-invoke] OK: model={resp_data.get('model')} tokens={input_tokens}+{output_tokens}")
+        return JSONResponse(result)
+
+    except aiohttp.ClientConnectorError:
+        return JSONResponse({"exitCode": 1, "timedOut": False, "errorMessage": "Hermes not reachable",
+                             "summary": "Gateway starting", "resultJson": {"result": "", "session_id": ""}})
+    except asyncio.TimeoutError:
+        return JSONResponse({"exitCode": 1, "timedOut": True, "errorMessage": "Timed out",
+                             "summary": "Timed out", "resultJson": {"result": "", "session_id": ""}})
+    except Exception as e:
+        print(f"[paperclip-invoke] Error: {type(e).__name__}: {e}")
+        return JSONResponse({"exitCode": 1, "timedOut": False, "errorMessage": str(e),
+                             "summary": f"Error: {e}", "resultJson": {"result": "", "session_id": ""}})
+
+
+# Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂ /v1/* Reverse Proxy to Hermes API Server Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
 
 _proxy_session: aiohttp.ClientSession | None = None if AIOHTTP_AVAILABLE else None
 
@@ -245,10 +391,10 @@ async def _close_proxy_session():
 
 async def v1_proxy(request: Request):
     """Reverse-proxy /v1/* requests to the internal Hermes API server.
-    No basic auth required â Hermes uses its own API_SERVER_KEY Bearer auth."""
+    No basic auth required Ã¢ÂÂ Hermes uses its own API_SERVER_KEY Bearer auth."""
     if not AIOHTTP_AVAILABLE:
         return JSONResponse(
-            {"error": "aiohttp not installed â proxy unavailable"},
+            {"error": "aiohttp not installed Ã¢ÂÂ proxy unavailable"},
             status_code=503,
         )
 
@@ -310,7 +456,7 @@ async def v1_proxy(request: Request):
             )
     except aiohttp.ClientConnectorError:
         return JSONResponse(
-            {"error": "Hermes API server not reachable â gateway may still be starting"},
+            {"error": "Hermes API server not reachable Ã¢ÂÂ gateway may still be starting"},
             status_code=503,
         )
     except asyncio.TimeoutError:
@@ -325,7 +471,7 @@ async def v1_proxy(request: Request):
         )
 
 
-# âââ End Proxy âââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂ End Proxy Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
 
 
 class GatewayManager:
@@ -692,7 +838,9 @@ routes = [
     Route("/api/pairing/deny", api_pairing_deny, methods=["POST"]),
     Route("/api/pairing/approved", api_pairing_approved),
     Route("/api/pairing/revoke", api_pairing_revoke, methods=["POST"]),
-    # Reverse proxy: /v1/* â Hermes API server (no basic auth â uses Bearer token)
+    # Paperclip translation endpoint (no basic auth)
+    Route("/paperclip/invoke", paperclip_invoke, methods=["POST"]),
+        # Reverse proxy: /v1/* Ã¢ÂÂ Hermes API server (no basic auth Ã¢ÂÂ uses Bearer token)
     Route("/v1/{path:path}", v1_proxy, methods=["GET", "POST", "PUT", "DELETE", "PATCH"]),
 ]
 
