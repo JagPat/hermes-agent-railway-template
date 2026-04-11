@@ -76,3 +76,5 @@ OpenRouter, DeepSeek, DashScope, GLM/Z.AI, Kimi, MiniMax, Hugging Face
 ## Supported Channels
 
 Telegram, Discord, Slack, WhatsApp, Email, Mattermost, Matrix
+
+<!-- Paperclip integration deployed -->
