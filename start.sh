@@ -6,27 +6,37 @@ mkdir -p /data/.hermes/skills
 mkdir -p /data/.hermes/workspace
 mkdir -p /data/.hermes/pairing
 
-# Create config.yaml with model + disable all skills for lean system prompt
-# Skills inflate the system prompt from ~500 tokens to 12K+ tokens
-# For a trading gateway, we don't need general-purpose skills
+# Create config.yaml optimized for trading gateway use case:
+# - Minimal tools (no file editing, terminal, code execution)
+# - No skills (Chanakya has its own learning system)
+# - Lean system prompt (~500 tokens instead of 12K)
 MODEL="${LLM_MODEL:-${HERMES_MODEL:-anthropic/claude-haiku-4-5}}"
 cat > /data/.hermes/config.yaml <<EOF
 model: $MODEL
+
+# Disable all tools for API/gateway mode — Chanakya only uses chat completions
+# Each tool definition adds ~500-800 tokens to the system prompt
+# 16 tools = ~12,000 tokens of overhead on every single call
+platform_toolsets:
+  api: []
+  gateway: []
+  cli: []
+
+# Disable all skills — Chanakya has its own FewShot/Hermes learning system
 skills:
-  disabled:
-    - "*"
+  disabled_all: true
+
+# Lean agent — no tool enforcement, no skill guidance
+agent:
+  tool_use_enforcement: false
 EOF
-echo "[start.sh] Created config.yaml with model=$MODEL, skills disabled for lean prompt"
+echo "[start.sh] Created config.yaml: model=$MODEL, tools disabled, skills disabled"
 
-# Clear accumulated skills to prevent system prompt inflation
-# Hermes learns and saves skills over time — each one adds tokens to every request
-if [ "${HERMES_CLEAR_SKILLS:-false}" = "true" ]; then
-  rm -rf /data/.hermes/skills/*
-  echo "[start.sh] Cleared accumulated skills (HERMES_CLEAR_SKILLS=true)"
-fi
+# Clear accumulated skills
+rm -rf /data/.hermes/skills/*
+echo "[start.sh] Cleared accumulated skills"
 
-# Clear old sessions to prevent memory accumulation
+# Clear old sessions (>7 days)
 find /data/.hermes/sessions -name "*.json" -mtime +7 -delete 2>/dev/null || true
-echo "[start.sh] Cleaned sessions older than 7 days"
 
 exec python /app/server.py
