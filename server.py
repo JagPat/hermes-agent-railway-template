@@ -44,6 +44,8 @@ if not ADMIN_PASSWORD:
 HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 ENV_FILE_PATH = Path(HERMES_HOME) / ".env"
 PAIRING_DIR = Path(HERMES_HOME) / "pairing"
+SESSIONS_DIR = Path(HERMES_HOME) / "sessions"
+SESSION_REGISTRY_PATH = SESSIONS_DIR / "_registry.json"
 CODE_TTL_SECONDS = 3600
 
 API_SERVER_HOST = os.environ.get("API_SERVER_HOST", "127.0.0.1")
@@ -188,6 +190,222 @@ def merge_secrets(new_vars: dict[str, str], existing_vars: dict[str, str]) -> di
     return result
 
 
+# ─── Session Registry ──────────────────────────────────────────────────
+# Hermes serves two separate products — Vitan Architects (architecture
+# firm) and Chanakya-Bot (personal trading system) — via the same gateway.
+# Sessions are namespaced so memory/conversation context for one product
+# NEVER bleeds into the other.
+#
+# Registry file: /data/.hermes/sessions/_registry.json
+# Callers identify themselves with a friendly `x-caller-id` header (e.g.
+# `chanakya-brain`) which is auto-mapped to a namespaced session_id
+# (`chanakya:brain`). Callers may also send `x-hermes-session-id` directly
+# for ad-hoc or explicit namespacing.
+
+VALID_NAMESPACES = ("vitan", "chanakya")
+
+# Default sessions created lazily on first boot. Callers that use these
+# identifiers get consistent, persistent context across deploys.
+DEFAULT_SESSIONS = {
+    # ── Vitan Architects — Paperclip agent ecosystem ───────────────
+    "vitan:founding-engineer": {
+        "namespace": "vitan",
+        "label": "Founding Engineer",
+        "description": "Technical implementation, codebase quality, automation",
+    },
+    "vitan:business-builder": {
+        "namespace": "vitan",
+        "label": "Business Builder",
+        "description": "Prospect scanning, market intelligence, outreach strategy",
+    },
+    "vitan:principle-architect": {
+        "namespace": "vitan",
+        "label": "Principle Architect",
+        "description": "System design, frameworks, best practices research",
+    },
+    "vitan:hr": {
+        "namespace": "vitan",
+        "label": "HR",
+        "description": "Internal processes, team coordination",
+    },
+    "vitan:brand-storyteller": {
+        "namespace": "vitan",
+        "label": "Brand Storyteller",
+        "description": "Marketing narrative, content creation",
+    },
+    "vitan:digital-presence": {
+        "namespace": "vitan",
+        "label": "Digital Presence Manager",
+        "description": "Social media, web presence",
+    },
+    "vitan:outreach-coordinator": {
+        "namespace": "vitan",
+        "label": "Outreach Coordinator",
+        "description": "Client outreach, partnerships",
+    },
+    # ── Chanakya-Bot — trading services ────────────────────────────
+    "chanakya:brain": {
+        "namespace": "chanakya",
+        "label": "Chanakya Brain",
+        "description": "Main AI orchestration — verdicts, recommendations",
+    },
+    "chanakya:worker": {
+        "namespace": "chanakya",
+        "label": "Chanakya Worker",
+        "description": "Background analysis loop, scheduling",
+    },
+    "chanakya:central": {
+        "namespace": "chanakya",
+        "label": "Chanakya Central (OTS)",
+        "description": "Operational truth service queries",
+    },
+    "chanakya:sage": {
+        "namespace": "chanakya",
+        "label": "Chanakya Sage",
+        "description": "User-facing conversational assistant",
+    },
+    "chanakya:optimizer": {
+        "namespace": "chanakya",
+        "label": "Strategy Optimizer",
+        "description": "Dedicated context for STRATEGY_OPTIMIZATION feature",
+    },
+    "chanakya:analyst": {
+        "namespace": "chanakya",
+        "label": "Deep Analyst",
+        "description": "Dedicated context for DEEP_ANALYSIS feature",
+    },
+}
+
+# Friendly caller-id -> namespaced session_id mapping. Keys are
+# case-insensitive and normalised to lowercase before lookup.
+CALLER_ALIASES = {
+    # Vitan — Paperclip agents
+    "vitan-founding-engineer": "vitan:founding-engineer",
+    "vitan-business-builder": "vitan:business-builder",
+    "vitan-principle-architect": "vitan:principle-architect",
+    "vitan-hr": "vitan:hr",
+    "vitan-brand-storyteller": "vitan:brand-storyteller",
+    "vitan-digital-presence": "vitan:digital-presence",
+    "vitan-outreach-coordinator": "vitan:outreach-coordinator",
+    # Chanakya services
+    "chanakya-brain": "chanakya:brain",
+    "chanakya-worker": "chanakya:worker",
+    "chanakya-central": "chanakya:central",
+    "chanakya-sage": "chanakya:sage",
+    "chanakya-optimizer": "chanakya:optimizer",
+    "chanakya-analyst": "chanakya:analyst",
+}
+
+_SESSION_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-]*:[a-zA-Z0-9][a-zA-Z0-9_\-]*$")
+
+
+def _load_session_registry() -> dict:
+    if not SESSION_REGISTRY_PATH.exists():
+        return {}
+    try:
+        data = json.loads(SESSION_REGISTRY_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[sessions] Failed to load registry: {exc}")
+        return {}
+
+
+def _save_session_registry(registry: dict) -> None:
+    try:
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        SESSION_REGISTRY_PATH.write_text(
+            json.dumps(registry, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(f"[sessions] Failed to save registry: {exc}")
+
+
+def _ensure_default_sessions() -> dict:
+    """Create default session entries if they don't yet exist. Idempotent."""
+    registry = _load_session_registry()
+    changed = False
+    for sid, info in DEFAULT_SESSIONS.items():
+        if sid not in registry:
+            registry[sid] = {
+                **info,
+                "created_at": time.time(),
+                "last_used": None,
+                "request_count": 0,
+            }
+            changed = True
+    if changed:
+        _save_session_registry(registry)
+        print(f"[sessions] Seeded {len(DEFAULT_SESSIONS)} default sessions")
+    return registry
+
+
+def _validate_session_id(session_id: str | None) -> str | None:
+    """Return session_id if it has a valid namespace prefix, else None."""
+    if not session_id or not isinstance(session_id, str):
+        return None
+    if not _SESSION_ID_PATTERN.match(session_id):
+        return None
+    namespace = session_id.split(":", 1)[0]
+    if namespace not in VALID_NAMESPACES:
+        return None
+    return session_id
+
+
+def _resolve_caller_to_session(caller_id: str | None) -> str | None:
+    """Map a friendly caller-id into a namespaced session_id."""
+    if not caller_id:
+        return None
+    key = caller_id.strip().lower()
+    if not key:
+        return None
+    if key in CALLER_ALIASES:
+        return CALLER_ALIASES[key]
+    # Accept already-namespaced ids as-is
+    return _validate_session_id(caller_id)
+
+
+_session_lock = asyncio.Lock()
+
+
+async def _touch_session(session_id: str) -> None:
+    """Update last_used + request_count for a session. Creates entry if missing."""
+    async with _session_lock:
+        registry = _load_session_registry()
+        entry = registry.get(session_id)
+        if not entry:
+            namespace = session_id.split(":", 1)[0]
+            entry = {
+                "namespace": namespace,
+                "label": session_id,
+                "description": "Auto-created on first use",
+                "created_at": time.time(),
+                "last_used": None,
+                "request_count": 0,
+            }
+        entry["last_used"] = time.time()
+        entry["request_count"] = int(entry.get("request_count", 0)) + 1
+        registry[session_id] = entry
+        _save_session_registry(registry)
+
+
+def _resolve_session_from_request(request: Request) -> str | None:
+    """Resolve a valid namespaced session_id from request headers.
+
+    Priority: explicit x-hermes-session-id > friendly x-caller-id alias.
+    Returns None if neither header yields a valid namespaced id.
+    """
+    explicit = request.headers.get("x-hermes-session-id")
+    resolved = _validate_session_id(explicit)
+    if resolved:
+        return resolved
+    caller_id = request.headers.get("x-caller-id")
+    return _resolve_caller_to_session(caller_id)
+
+
+# ─── End Session Registry ──────────────────────────────────────────────
+
+
 class BasicAuthBackend(AuthenticationBackend):
     async def authenticate(self, conn):
         # Skip basic auth for /v1/* routes Ã¢ÂÂ they use Bearer token auth via Hermes API server
@@ -300,12 +518,29 @@ async def paperclip_invoke(request: Request):
         "max_tokens": 16384,
     }
 
-    # Session support
+    # Session resolution (Phase 3):
+    #   1) Explicit sessionParams.sessionId from the Paperclip payload.
+    #   2) x-hermes-session-id header (already validated against namespaces).
+    #   3) x-caller-id header mapped via CALLER_ALIASES.
+    #   4) agentId from the Paperclip body mapped via CALLER_ALIASES.
     session_id = None
     ctx = body.get("context", {})
     if isinstance(ctx, dict):
         sp = ctx.get("sessionParams") or {}
-        session_id = sp.get("sessionId") if isinstance(sp, dict) else None
+        raw_id = sp.get("sessionId") if isinstance(sp, dict) else None
+        session_id = _validate_session_id(raw_id)
+
+    if not session_id:
+        session_id = _resolve_session_from_request(request)
+
+    if not session_id and agent_id and agent_id != "unknown":
+        session_id = _resolve_caller_to_session(agent_id)
+
+    if session_id:
+        try:
+            await _touch_session(session_id)
+        except Exception as exc:
+            print(f"[paperclip-invoke] Session touch failed: {exc}")
 
     target_url = f"{API_SERVER_TARGET}/v1/chat/completions"
     forward_headers = {"content-type": "application/json"}
@@ -409,6 +644,17 @@ async def v1_proxy(request: Request):
         val = request.headers.get(key)
         if val:
             forward_headers[key] = val
+
+    # Phase 3: resolve friendly x-caller-id into a namespaced session_id
+    # and track usage on the registry. Explicit x-hermes-session-id (if
+    # valid) always wins; otherwise we map the caller alias.
+    resolved_session = _resolve_session_from_request(request)
+    if resolved_session:
+        forward_headers["x-hermes-session-id"] = resolved_session
+        try:
+            await _touch_session(resolved_session)
+        except Exception as exc:
+            print(f"[v1-proxy] Session touch failed: {exc}")
 
     body = await request.body()
 
@@ -816,6 +1062,99 @@ async def api_pairing_revoke(request: Request):
     return JSONResponse({"ok": True})
 
 
+# ─── Session registry API ─────────────────────────────────────────────
+
+
+async def api_sessions_list(request: Request):
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+    registry = _load_session_registry()
+    # Return a stable, sorted list grouped by namespace
+    sessions = []
+    for sid, info in sorted(registry.items()):
+        if not isinstance(info, dict):
+            continue
+        sessions.append({
+            "session_id": sid,
+            "namespace": info.get("namespace", sid.split(":", 1)[0] if ":" in sid else "unknown"),
+            "label": info.get("label", sid),
+            "description": info.get("description", ""),
+            "created_at": info.get("created_at"),
+            "last_used": info.get("last_used"),
+            "request_count": info.get("request_count", 0),
+        })
+    return JSONResponse({
+        "namespaces": list(VALID_NAMESPACES),
+        "sessions": sessions,
+        "aliases": CALLER_ALIASES,
+    })
+
+
+async def api_sessions_create(request: Request):
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    session_id = body.get("session_id", "").strip()
+    valid = _validate_session_id(session_id)
+    if not valid:
+        return JSONResponse({
+            "error": f"session_id must be '<namespace>:<name>' where namespace is one of {list(VALID_NAMESPACES)}",
+        }, status_code=400)
+
+    label = body.get("label") or valid
+    description = body.get("description") or ""
+
+    async with _session_lock:
+        registry = _load_session_registry()
+        if valid in registry:
+            return JSONResponse({"error": "Session already exists", "session_id": valid}, status_code=409)
+        registry[valid] = {
+            "namespace": valid.split(":", 1)[0],
+            "label": label,
+            "description": description,
+            "created_at": time.time(),
+            "last_used": None,
+            "request_count": 0,
+        }
+        _save_session_registry(registry)
+
+    return JSONResponse({"ok": True, "session_id": valid})
+
+
+async def api_sessions_delete(request: Request):
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    session_id = body.get("session_id", "").strip()
+    if not session_id:
+        return JSONResponse({"error": "session_id required"}, status_code=400)
+
+    async with _session_lock:
+        registry = _load_session_registry()
+        if session_id not in registry:
+            return JSONResponse({"error": "Session not found"}, status_code=404)
+        del registry[session_id]
+        _save_session_registry(registry)
+
+    # Best-effort cleanup of any per-session JSON files Hermes itself wrote.
+    # The Hermes API server owns those — we only prune the registry entry.
+    return JSONResponse({"ok": True, "session_id": session_id})
+
+
+# ─── End session registry API ─────────────────────────────────────────
+
+
 async def auto_start_gateway():
     env_vars = read_env_file(ENV_FILE_PATH)
     has_provider = any(env_vars.get(key) for key in PROVIDER_KEYS)
@@ -838,6 +1177,9 @@ routes = [
     Route("/api/pairing/deny", api_pairing_deny, methods=["POST"]),
     Route("/api/pairing/approved", api_pairing_approved),
     Route("/api/pairing/revoke", api_pairing_revoke, methods=["POST"]),
+    Route("/api/sessions", api_sessions_list, methods=["GET"]),
+    Route("/api/sessions", api_sessions_create, methods=["POST"]),
+    Route("/api/sessions/delete", api_sessions_delete, methods=["POST"]),
     # Paperclip translation endpoint (no basic auth)
     Route("/paperclip/invoke", paperclip_invoke, methods=["POST"]),
         # Reverse proxy: /v1/* Ã¢ÂÂ Hermes API server (no basic auth Ã¢ÂÂ uses Bearer token)
@@ -846,6 +1188,12 @@ routes = [
 
 @asynccontextmanager
 async def lifespan(app):
+    # Seed the session registry with the default Vitan + Chanakya entries
+    # on first boot. Idempotent — existing entries are preserved.
+    try:
+        _ensure_default_sessions()
+    except Exception as exc:
+        print(f"[lifespan] Session seeding failed: {exc}")
     await auto_start_gateway()
     yield
     await _close_proxy_session()
