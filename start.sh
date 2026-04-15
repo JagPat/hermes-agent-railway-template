@@ -19,14 +19,14 @@ model: $MODEL
 # session_search: recall past conversations (context)
 # Everything else is for interactive coding — not needed for API gateway
 platform_toolsets:
-  api: [memory, session_search]
-  gateway: [memory, session_search]
+  api: [memory, session_search, terminal, file, web]
+  gateway: [memory, session_search, terminal, file, web]
 
 # Disable accumulated skills (Chanakya has its own FewShot/Hermes learning)
 skills:
-  disabled_all: true
+  disabled_all: false
 EOF
-echo "[start.sh] Created config.yaml: model=$MODEL, tools=memory+session_search only"
+echo "[start.sh] Created config.yaml: model=$MODEL, tools=memory+session_search+terminal+file+web, skills=enabled"
 
 # Clear old sessions (>7 days) to prevent unbounded growth
 find /data/.hermes/sessions -name "*.json" -mtime +7 -delete 2>/dev/null || true
