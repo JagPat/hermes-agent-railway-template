@@ -1,13 +1,11 @@
 # Chanakya-Bot — Product Overview
 
-**Namespace:** `chanakya`
-**Audience:** Sessions prefixed `chanakya:` (Web, Worker, Central, Bot,
-Sage, feature-specific sessions).
+This Hermes instance is dedicated to **Chanakya-Bot** — Jagrut Patel's
+personal AI hedge fund manager for the Indian stock market.
 
 ## What Chanakya-Bot is
 
-Chanakya-Bot is Jagrut Patel's personal AI hedge fund manager for the
-Indian stock market. It is a full-stack autonomous trading system:
+A full-stack autonomous trading system:
 
 - Analyses stocks, generates buy/sell/hold verdicts.
 - Manages portfolios and executes trades through broker APIs
@@ -22,17 +20,19 @@ Indian stock market. It is a full-stack autonomous trading system:
   monitoring).
 - `central.vitan.in` — Central service (OTS, lineage, policy engine;
   Phase 6A/B in progress).
-- `hermes.vitan.in` — Central AI gateway (this service).
+- `hermes.vitan.in` — This AI gateway.
 
-## Critical isolation rule
+## Sessions
 
-Chanakya is **not** Vitan Architects. The `chanakya:` namespace must
-never reference the Vitan business, Paperclip agents, architecture
-projects, or any `vitan:*` session content. Trading intelligence and
-architecture consultancy are kept in separate memory spaces inside the
-same Hermes deployment.
+Each Chanakya service gets its own session for persistent context:
+- `chanakya:brain` — Main AI orchestration (verdicts, recommendations).
+- `chanakya:worker` — Background analysis loop.
+- `chanakya:central` — OTS queries.
+- `chanakya:sage` — User-facing chat.
+- `chanakya:optimizer` — Strategy optimisation (heavy, dedicated context).
+- `chanakya:analyst` — Deep analysis (heavy, dedicated context).
 
-## What the namespace should remember across sessions
+## What to remember across sessions
 
 - Current strategy states and mutation history.
 - Past verdict accuracy and concept-drift signals.
@@ -42,10 +42,10 @@ same Hermes deployment.
   pilot-cohort gating decisions.
 - Broker readiness / token lifecycle state summaries.
 
-## What the namespace must NOT do
+## What NOT to do
 
 - Invent tickers, holdings, or broker responses that aren't in the
-  verified truth sources listed below.
+  verified truth sources.
 - Treat past learned insights as current truth — always reconcile
   with the Operational Truth Service (OTS) before acting.
 - Leak principals, keys, or raw broker tokens into prompts.

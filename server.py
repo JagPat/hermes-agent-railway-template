@@ -191,103 +191,48 @@ def merge_secrets(new_vars: dict[str, str], existing_vars: dict[str, str]) -> di
 
 
 # ─── Session Registry ──────────────────────────────────────────────────
-# Hermes serves two separate products — Vitan Architects (architecture
-# firm) and Chanakya-Bot (personal trading system) — via the same gateway.
-# Sessions are namespaced so memory/conversation context for one product
-# NEVER bleeds into the other.
+# This Hermes instance is dedicated to Chanakya-Bot (AI trading platform).
+# Each Chanakya service (web, worker, central, bot) gets its own session
+# for persistent conversation context. Heavy features (strategy optimisation,
+# deep analysis) route to dedicated sessions to avoid context pollution.
 #
 # Registry file: /data/.hermes/sessions/_registry.json
 # Callers identify themselves with a friendly `x-caller-id` header (e.g.
-# `chanakya-brain`) which is auto-mapped to a namespaced session_id
-# (`chanakya:brain`). Callers may also send `x-hermes-session-id` directly
-# for ad-hoc or explicit namespacing.
-
-VALID_NAMESPACES = ("vitan", "chanakya")
+# `chanakya-brain`) which is auto-mapped to a session_id (`chanakya:brain`).
+# Callers may also send `x-hermes-session-id` directly.
 
 # Default sessions created lazily on first boot. Callers that use these
 # identifiers get consistent, persistent context across deploys.
 DEFAULT_SESSIONS = {
-    # ── Vitan Architects — Paperclip agent ecosystem ───────────────
-    "vitan:founding-engineer": {
-        "namespace": "vitan",
-        "label": "Founding Engineer",
-        "description": "Technical implementation, codebase quality, automation",
-    },
-    "vitan:business-builder": {
-        "namespace": "vitan",
-        "label": "Business Builder",
-        "description": "Prospect scanning, market intelligence, outreach strategy",
-    },
-    "vitan:principle-architect": {
-        "namespace": "vitan",
-        "label": "Principle Architect",
-        "description": "System design, frameworks, best practices research",
-    },
-    "vitan:hr": {
-        "namespace": "vitan",
-        "label": "HR",
-        "description": "Internal processes, team coordination",
-    },
-    "vitan:brand-storyteller": {
-        "namespace": "vitan",
-        "label": "Brand Storyteller",
-        "description": "Marketing narrative, content creation",
-    },
-    "vitan:digital-presence": {
-        "namespace": "vitan",
-        "label": "Digital Presence Manager",
-        "description": "Social media, web presence",
-    },
-    "vitan:outreach-coordinator": {
-        "namespace": "vitan",
-        "label": "Outreach Coordinator",
-        "description": "Client outreach, partnerships",
-    },
-    # ── Chanakya-Bot — trading services ────────────────────────────
     "chanakya:brain": {
-        "namespace": "chanakya",
         "label": "Chanakya Brain",
         "description": "Main AI orchestration — verdicts, recommendations",
     },
     "chanakya:worker": {
-        "namespace": "chanakya",
         "label": "Chanakya Worker",
         "description": "Background analysis loop, scheduling",
     },
     "chanakya:central": {
-        "namespace": "chanakya",
         "label": "Chanakya Central (OTS)",
         "description": "Operational truth service queries",
     },
     "chanakya:sage": {
-        "namespace": "chanakya",
         "label": "Chanakya Sage",
         "description": "User-facing conversational assistant",
     },
     "chanakya:optimizer": {
-        "namespace": "chanakya",
         "label": "Strategy Optimizer",
         "description": "Dedicated context for STRATEGY_OPTIMIZATION feature",
     },
     "chanakya:analyst": {
-        "namespace": "chanakya",
         "label": "Deep Analyst",
         "description": "Dedicated context for DEEP_ANALYSIS feature",
     },
 }
 
-# Friendly caller-id -> namespaced session_id mapping. Keys are
-# case-insensitive and normalised to lowercase before lookup.
+# Friendly caller-id -> session_id mapping. Keys are case-insensitive
+# and normalised to lowercase before lookup.
 CALLER_ALIASES = {
-    # Vitan — Paperclip agents
-    "vitan-founding-engineer": "vitan:founding-engineer",
-    "vitan-business-builder": "vitan:business-builder",
-    "vitan-principle-architect": "vitan:principle-architect",
-    "vitan-hr": "vitan:hr",
-    "vitan-brand-storyteller": "vitan:brand-storyteller",
-    "vitan-digital-presence": "vitan:digital-presence",
-    "vitan-outreach-coordinator": "vitan:outreach-coordinator",
-    # Chanakya services
     "chanakya-brain": "chanakya:brain",
     "chanakya-worker": "chanakya:worker",
     "chanakya-central": "chanakya:central",
@@ -341,13 +286,10 @@ def _ensure_default_sessions() -> dict:
 
 
 def _validate_session_id(session_id: str | None) -> str | None:
-    """Return session_id if it has a valid namespace prefix, else None."""
+    """Return session_id if it matches the `prefix:name` format, else None."""
     if not session_id or not isinstance(session_id, str):
         return None
     if not _SESSION_ID_PATTERN.match(session_id):
-        return None
-    namespace = session_id.split(":", 1)[0]
-    if namespace not in VALID_NAMESPACES:
         return None
     return session_id
 
@@ -374,9 +316,7 @@ async def _touch_session(session_id: str) -> None:
         registry = _load_session_registry()
         entry = registry.get(session_id)
         if not entry:
-            namespace = session_id.split(":", 1)[0]
             entry = {
-                "namespace": namespace,
                 "label": session_id,
                 "description": "Auto-created on first use",
                 "created_at": time.time(),
@@ -1077,7 +1017,6 @@ async def api_sessions_list(request: Request):
             continue
         sessions.append({
             "session_id": sid,
-            "namespace": info.get("namespace", sid.split(":", 1)[0] if ":" in sid else "unknown"),
             "label": info.get("label", sid),
             "description": info.get("description", ""),
             "created_at": info.get("created_at"),
@@ -1085,7 +1024,6 @@ async def api_sessions_list(request: Request):
             "request_count": info.get("request_count", 0),
         })
     return JSONResponse({
-        "namespaces": list(VALID_NAMESPACES),
         "sessions": sessions,
         "aliases": CALLER_ALIASES,
     })
@@ -1104,7 +1042,7 @@ async def api_sessions_create(request: Request):
     valid = _validate_session_id(session_id)
     if not valid:
         return JSONResponse({
-            "error": f"session_id must be '<namespace>:<name>' where namespace is one of {list(VALID_NAMESPACES)}",
+            "error": "session_id must be in 'prefix:name' format (e.g. 'chanakya:my-session')",
         }, status_code=400)
 
     label = body.get("label") or valid
@@ -1115,7 +1053,6 @@ async def api_sessions_create(request: Request):
         if valid in registry:
             return JSONResponse({"error": "Session already exists", "session_id": valid}, status_code=409)
         registry[valid] = {
-            "namespace": valid.split(":", 1)[0],
             "label": label,
             "description": description,
             "created_at": time.time(),

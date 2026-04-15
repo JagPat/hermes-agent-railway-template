@@ -1,8 +1,8 @@
 # Chanakya — Existing Hermes Integration
 
 This memory summarises the Chanakya-side integration with Hermes that
-is **already built and running**. Skills and prompts in the
-`chanakya:` namespace must AUGMENT this pipeline, never replace it.
+is **already built and running**. Skills and prompts must AUGMENT this
+pipeline, never replace it.
 
 Source files in `JagPat/chanakya-bot`:
 

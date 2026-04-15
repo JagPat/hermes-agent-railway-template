@@ -17,8 +17,9 @@ RUN mkdir -p /data/.hermes
 COPY server.py /app/server.py
 COPY templates/ /app/templates/
 COPY start.sh /app/start.sh
-# Phase 3: ship namespaced memory + skills seeds. start.sh copies them
-# to /data/.hermes on first boot without overwriting learned content.
+# Chanakya trading intelligence: memory seeds + skills.
+# start.sh copies them to /data/.hermes on first boot without
+# overwriting learned content that Hermes has accumulated.
 COPY memory/ /app/memory/
 COPY skills/ /app/skills/
 RUN chmod +x /app/start.sh

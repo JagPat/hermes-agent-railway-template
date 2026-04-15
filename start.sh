@@ -5,57 +5,68 @@ mkdir -p /data/.hermes/sessions
 mkdir -p /data/.hermes/skills
 mkdir -p /data/.hermes/workspace
 mkdir -p /data/.hermes/pairing
-mkdir -p /data/.hermes/memory/vitan
-mkdir -p /data/.hermes/memory/chanakya
-mkdir -p /data/.hermes/skills/vitan
-mkdir -p /data/.hermes/skills/chanakya
+mkdir -p /data/.hermes/memory
 
-# ── Phase 3: seed namespaced memory + skills from the image ──────────
-# Files under /app/memory/{vitan,chanakya} and /app/skills/{vitan,chanakya}
-# are shipped in the container. On first boot (or when a file is missing)
-# they are copied into the persistent /data volume WITHOUT overwriting
-# anything that is already there — Hermes accumulates learned context on
-# top of the seed and we must not clobber it on redeploys.
-for ns in vitan chanakya; do
-  if [ -d "/app/memory/$ns" ]; then
-    for src in /app/memory/$ns/*.md; do
-      [ -e "$src" ] || continue
-      dst="/data/.hermes/memory/$ns/$(basename "$src")"
-      if [ ! -e "$dst" ]; then
-        cp "$src" "$dst"
-        echo "[start.sh] Seeded memory: $dst"
-      fi
-    done
+# ── Seed memory + skills from the image ──────────────────────────────
+# This instance is dedicated to Chanakya-Bot (trading platform).
+# Files under /app/memory/ and /app/skills/ are shipped in the container.
+# On first boot (or when a file is missing) they are copied into the
+# persistent /data volume WITHOUT overwriting anything already there —
+# Hermes accumulates learned context on top of the seed and we must not
+# clobber it on redeploys.
+for src in /app/memory/*.md; do
+  [ -e "$src" ] || continue
+  dst="/data/.hermes/memory/$(basename "$src")"
+  if [ ! -e "$dst" ]; then
+    cp "$src" "$dst"
+    echo "[start.sh] Seeded memory: $dst"
   fi
-  if [ -d "/app/skills/$ns" ]; then
-    for src in /app/skills/$ns/*.md; do
-      [ -e "$src" ] || continue
-      dst="/data/.hermes/skills/$ns/$(basename "$src")"
-      if [ ! -e "$dst" ]; then
-        cp "$src" "$dst"
-        echo "[start.sh] Seeded skill: $dst"
-      fi
-    done
+done
+for src in /app/skills/*.md; do
+  [ -e "$src" ] || continue
+  dst="/data/.hermes/skills/$(basename "$src")"
+  if [ ! -e "$dst" ]; then
+    cp "$src" "$dst"
+    echo "[start.sh] Seeded skill: $dst"
   fi
 done
 
-# Config optimized for trading gateway:
-# KEEP: memory, session_search (Hermes self-learning across sessions)
-# REMOVE: file editing, terminal, code execution, vision, cron (coding assistant tools)
-# This preserves Hermes' ability to learn and remember while cutting ~10K tokens
+# ── Clean stale namespace subdirs from Phase 3 v1 ────────────────────
+# Phase 3 originally seeded into /data/.hermes/memory/{vitan,chanakya}/
+# and /data/.hermes/skills/{vitan,chanakya}/. This instance is now
+# Chanakya-only with flat directories. Migrate any Chanakya files that
+# were seeded under the old namespace path, then remove old dirs.
+for dir in memory skills; do
+  old="/data/.hermes/$dir/chanakya"
+  if [ -d "$old" ]; then
+    for f in "$old"/*.md; do
+      [ -e "$f" ] || continue
+      target="/data/.hermes/$dir/$(basename "$f")"
+      if [ ! -e "$target" ]; then
+        mv "$f" "$target"
+        echo "[start.sh] Migrated $dir: $f → $target"
+      fi
+    done
+    rm -rf "$old"
+    echo "[start.sh] Removed old namespace dir: $old"
+  fi
+  # Remove vitan namespace dir if present (no longer served by this instance)
+  old_vitan="/data/.hermes/$dir/vitan"
+  if [ -d "$old_vitan" ]; then
+    rm -rf "$old_vitan"
+    echo "[start.sh] Removed vitan dir: $old_vitan (not served by this instance)"
+  fi
+done
+
+# Config for Chanakya trading intelligence gateway
 MODEL="${LLM_MODEL:-${HERMES_MODEL:-anthropic/claude-haiku-4-5}}"
 cat > /data/.hermes/config.yaml <<EOF
 model: $MODEL
 
-# Only include tools that support the self-learning architecture
-# memory: persistent memory across sessions (learning)
-# session_search: recall past conversations (context)
-# Everything else is for interactive coding — not needed for API gateway
 platform_toolsets:
   api: [memory, session_search, terminal, file, web]
   gateway: [memory, session_search, terminal, file, web]
 
-# Disable accumulated skills (Chanakya has its own FewShot/Hermes learning)
 skills:
   disabled_all: false
 EOF
