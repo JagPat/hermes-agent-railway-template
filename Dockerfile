@@ -1,7 +1,12 @@
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates git nodejs npm && \
+    apt-get install -y --no-install-recommends curl ca-certificates git && \
+    rm -rf /var/lib/apt/lists/*
+
+# Node.js 20.x required for Vite + Tailwind CSS v4 (Debian default is v18, too old)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
 RUN git clone --depth 1 --branch v2026.4.13 https://github.com/NousResearch/hermes-agent.git /tmp/hermes-agent && \
