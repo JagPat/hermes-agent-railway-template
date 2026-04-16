@@ -4,7 +4,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates git && \
     rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 --branch v2026.4.14 https://github.com/NousResearch/hermes-agent.git /tmp/hermes-agent && \
+RUN git clone --depth 1 --branch v2026.4.13 https://github.com/NousResearch/hermes-agent.git /tmp/hermes-agent && \
     cd /tmp/hermes-agent && \
     uv pip install --system --no-cache -e ".[all]" && \
     rm -rf /tmp/hermes-agent/.git
