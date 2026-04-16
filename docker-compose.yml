@@ -3,6 +3,7 @@ services:
     build: .
     ports:
       - "8080:8080"
+      - "9119:9119"
     environment:
       - PORT=8080
       - ADMIN_USERNAME=admin

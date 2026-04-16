@@ -75,4 +75,9 @@ echo "[start.sh] Created config.yaml: model=$MODEL, tools=memory+session_search+
 # Clear old sessions (>7 days) to prevent unbounded growth
 find /data/.hermes/sessions -name "*.json" -mtime +7 -delete 2>/dev/null || true
 
+# Start Mission Control dashboard on port 9119
+hermes dashboard --host 0.0.0.0 --port 9119 --no-open &
+DASHBOARD_PID=$!
+echo "[start.sh] Dashboard started on port 9119 (PID: $DASHBOARD_PID)"
+
 exec python /app/server.py
