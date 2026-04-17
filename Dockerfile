@@ -9,8 +9,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 --branch v2026.4.13 https://github.com/NousResearch/hermes-agent.git /tmp/hermes-agent && \
-    cd /tmp/hermes-agent && \
+RUN git clone --depth 1 --branch v2026.4.16 https://github.com/NousResearch/hermes-agent.git /tmp/hermes-agent && \    cd /tmp/hermes-agent && \
     uv pip install --system --no-cache -e ".[all,web]" && \
     rm -rf /tmp/hermes-agent/.git
 
