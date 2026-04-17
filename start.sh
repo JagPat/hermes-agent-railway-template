@@ -22,6 +22,7 @@ for src in /app/memory/*.md; do
     echo "[start.sh] Seeded memory: $dst"
   fi
 done
+
 for src in /app/skills/*.md; do
   [ -e "$src" ] || continue
   dst="/data/.hermes/skills/$(basename "$src")"
@@ -60,6 +61,18 @@ done
 
 # Config for Chanakya trading intelligence gateway
 MODEL="${LLM_MODEL:-${HERMES_MODEL:-anthropic/claude-haiku-4-5}}"
+
+# ── Config guard ─────────────────────────────────────────────────────
+# Preserve existing /data/.hermes/config.yaml when it contains user
+# customizations. The baseline below is ONLY seeded when no full config
+# is detected. Markers indicating a full/custom config:
+#   fallback_providers | smart_model_routing | auxiliary
+# Without this guard, every container recreate (Coolify Restart does
+# docker rm -f + rebuild, not docker restart) clobbers the routing
+# configuration — we learned this on 2026-04-17 during v0.10.0 upgrade.
+if grep -qE '^(fallback_providers|smart_model_routing|auxiliary):' /data/.hermes/config.yaml 2>/dev/null; then
+  echo "[start.sh] Preserved existing config.yaml (user-customized markers detected)"
+else
 cat > /data/.hermes/config.yaml <<EOF
 model: $MODEL
 
@@ -70,7 +83,8 @@ platform_toolsets:
 skills:
   disabled_all: false
 EOF
-echo "[start.sh] Created config.yaml: model=$MODEL, tools=memory+session_search+terminal+file+web, skills=enabled"
+echo "[start.sh] Seeded baseline config.yaml: model=$MODEL, tools=memory+session_search+terminal+file+web, skills=enabled"
+fi
 
 # Clear old sessions (>7 days) to prevent unbounded growth
 find /data/.hermes/sessions -name "*.json" -mtime +7 -delete 2>/dev/null || true
