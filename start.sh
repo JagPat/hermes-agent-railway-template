@@ -95,7 +95,14 @@ find /data/.hermes/sessions -name "*.json" -mtime +7 -delete 2>/dev/null || true
 # reads this log and reports bind state on demand.
 DASHBOARD_LOG=/data/.hermes/dashboard.log
 : > "$DASHBOARD_LOG"  # truncate on each boot
-hermes dashboard --host 0.0.0.0 --port 9119 --no-open >>"$DASHBOARD_LOG" 2>&1 &
+#
+# Bind to 127.0.0.1 (not 0.0.0.0): Hermes refuses to bind the dashboard
+# to a public interface without --insecure because the UI exposes API
+# keys and config with no auth of its own. We don't need it public:
+# server.py proxies /gateway-excluded paths to 127.0.0.1:9119 from
+# inside the same container, and basic auth on the wrapper is the only
+# thing that fronts Mission Control.
+hermes dashboard --host 127.0.0.1 --port 9119 --no-open >>"$DASHBOARD_LOG" 2>&1 &
 DASHBOARD_PID=$!
 echo "[start.sh] hermes dashboard launched (PID=$DASHBOARD_PID, log=$DASHBOARD_LOG)"
 
