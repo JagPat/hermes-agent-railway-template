@@ -695,8 +695,12 @@ async def dashboard_http_proxy(request: Request):
     """Reverse-proxy HTTP requests to the Mission Control dashboard.
 
     Streams raw bytes to preserve binary assets (JS bundles, images, fonts).
-    Basic auth is enforced upstream by AuthenticationMiddleware.
+    Requires Basic auth — Mission Control ships with no auth of its own.
     """
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+
     if not AIOHTTP_AVAILABLE:
         return JSONResponse(
             {"error": "aiohttp not installed - proxy unavailable"},
@@ -757,8 +761,16 @@ async def dashboard_http_proxy(request: Request):
 async def dashboard_ws_proxy(websocket: WebSocket):
     """Bidirectional WebSocket relay for the dashboard.
 
-    Basic auth is enforced by AuthenticationMiddleware before this handler runs.
+    Requires Basic auth — unauthenticated connections are closed before accept.
     """
+    # Close unauthenticated WS before the handshake completes. Browsers that
+    # supply credentials on the parent HTTP page will carry them into the WS
+    # handshake via the Cookie / Authorization headers picked up by
+    # AuthenticationMiddleware.
+    if not getattr(websocket, "user", None) or not websocket.user.is_authenticated:
+        await websocket.close(code=1008, reason="Unauthorized")
+        return
+
     if not AIOHTTP_AVAILABLE:
         await websocket.close(code=1011, reason="aiohttp unavailable")
         return
