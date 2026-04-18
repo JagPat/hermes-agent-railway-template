@@ -1023,6 +1023,59 @@ async def api_logs(request: Request):
     return JSONResponse({"lines": list(gateway.logs)})
 
 
+async def api_diagnostics(request: Request):
+    """Report dashboard bind state + tail of /data/.hermes/dashboard.log.
+
+    Used to diagnose silent start failures of `hermes dashboard` without
+    needing shell access into the container. Basic-auth gated.
+    """
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+
+    # Probe the dashboard port with a short asyncio connect.
+    port_state = {"host": DASHBOARD_HOST, "port": int(DASHBOARD_PORT), "listening": False, "error": None}
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(DASHBOARD_HOST, int(DASHBOARD_PORT)),
+            timeout=2.0,
+        )
+        port_state["listening"] = True
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+    except Exception as exc:
+        port_state["error"] = f"{type(exc).__name__}: {exc}"
+
+    # Tail the dashboard log file if present.
+    log_path = Path(HERMES_HOME) / "dashboard.log"
+    log_info = {"path": str(log_path), "exists": log_path.exists(), "size": 0, "tail": []}
+    if log_path.exists():
+        try:
+            stat = log_path.stat()
+            log_info["size"] = stat.st_size
+            log_info["mtime"] = stat.st_mtime
+            # Read last ~16 KB and split into lines; keep last 120.
+            with log_path.open("rb") as fh:
+                if stat.st_size > 16384:
+                    fh.seek(-16384, 2)
+                    fh.readline()  # drop partial line
+                data = fh.read()
+            text = data.decode("utf-8", errors="replace")
+            lines = text.splitlines()[-120:]
+            log_info["tail"] = lines
+        except Exception as exc:
+            log_info["error"] = f"{type(exc).__name__}: {exc}"
+
+    return JSONResponse({
+        "dashboard_port": port_state,
+        "dashboard_log": log_info,
+        "gateway": gateway.get_status(),
+    })
+
+
 async def api_gateway_start(request: Request):
     auth_err = require_auth(request)
     if auth_err:
@@ -1305,6 +1358,7 @@ routes = [
     Route("/gateway/api/config", api_config_put, methods=["PUT"]),
     Route("/gateway/api/status", api_status),
     Route("/gateway/api/logs", api_logs),
+    Route("/gateway/api/diagnostics", api_diagnostics),
     Route("/gateway/api/gateway/start", api_gateway_start, methods=["POST"]),
     Route("/gateway/api/gateway/stop", api_gateway_stop, methods=["POST"]),
     Route("/gateway/api/gateway/restart", api_gateway_restart, methods=["POST"]),

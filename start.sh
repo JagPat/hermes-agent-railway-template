@@ -89,9 +89,36 @@ fi
 # Clear old sessions (>7 days) to prevent unbounded growth
 find /data/.hermes/sessions -name "*.json" -mtime +7 -delete 2>/dev/null || true
 
-# Start Mission Control dashboard on port 9119
-hermes dashboard --host 0.0.0.0 --port 9119 --no-open &
+# ── Start Mission Control dashboard on port 9119 ────────────────────
+# Redirect its stdout/stderr to a log file so we can diagnose silent
+# startup failures. The wrapper's /gateway/api/diagnostics endpoint
+# reads this log and reports bind state on demand.
+DASHBOARD_LOG=/data/.hermes/dashboard.log
+: > "$DASHBOARD_LOG"  # truncate on each boot
+hermes dashboard --host 0.0.0.0 --port 9119 --no-open >>"$DASHBOARD_LOG" 2>&1 &
 DASHBOARD_PID=$!
-echo "[start.sh] Dashboard started on port 9119 (PID: $DASHBOARD_PID)"
+echo "[start.sh] hermes dashboard launched (PID=$DASHBOARD_PID, log=$DASHBOARD_LOG)"
+
+# Probe port 9119 for up to 30s. Logs the outcome so Coolify shows it.
+DASHBOARD_UP=""
+for i in $(seq 1 30); do
+  if ! kill -0 "$DASHBOARD_PID" 2>/dev/null; then
+    echo "[start.sh] Dashboard PID $DASHBOARD_PID exited early (attempt $i). Log tail:"
+    tail -n 100 "$DASHBOARD_LOG" 2>/dev/null | sed 's/^/[dashboard] /' || true
+    break
+  fi
+  if (exec 3<>/dev/tcp/127.0.0.1/9119) 2>/dev/null; then
+    exec 3>&-
+    DASHBOARD_UP="yes"
+    echo "[start.sh] Dashboard listening on 127.0.0.1:9119 after ${i}s"
+    break
+  fi
+  sleep 1
+done
+
+if [ -z "$DASHBOARD_UP" ]; then
+  echo "[start.sh] Dashboard did NOT bind to 127.0.0.1:9119 within 30s. Log tail:"
+  tail -n 100 "$DASHBOARD_LOG" 2>/dev/null | sed 's/^/[dashboard] /' || true
+fi
 
 exec python /app/server.py
