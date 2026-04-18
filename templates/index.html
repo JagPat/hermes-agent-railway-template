@@ -508,7 +508,7 @@
 
         async loadConfig() {
           try {
-            const res = await fetch('/api/config');
+            const res = await fetch('/gateway/api/config');
             if (res.ok) {
               const data = await res.json();
               this.vars = data.vars || {};
@@ -524,7 +524,7 @@
               vars: JSON.parse(JSON.stringify(this.vars)),
               _restartGateway: this.restartAfterSave,
             };
-            const res = await fetch('/api/config', {
+            const res = await fetch('/gateway/api/config', {
               method: 'PUT',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload),
@@ -549,14 +549,14 @@
 
         async loadStatus() {
           try {
-            const res = await fetch('/api/status');
+            const res = await fetch('/gateway/api/status');
             if (res.ok) this.status = await res.json();
           } catch (e) {}
         },
 
         async loadLogs() {
           try {
-            const res = await fetch('/api/logs');
+            const res = await fetch('/gateway/api/logs');
             if (res.ok) {
               const data = await res.json();
               const wasAtBottom = this.$refs.logViewer &&
@@ -572,19 +572,19 @@
         },
 
         async startGateway() {
-          await fetch('/api/gateway/start', { method: 'POST' });
+          await fetch('/gateway/api/gateway/start', { method: 'POST' });
           this.showToast('Gateway starting', 'success');
           setTimeout(() => this.loadStatus(), 1000);
         },
 
         async stopGateway() {
-          await fetch('/api/gateway/stop', { method: 'POST' });
+          await fetch('/gateway/api/gateway/stop', { method: 'POST' });
           this.showToast('Gateway stopping', 'success');
           setTimeout(() => this.loadStatus(), 1000);
         },
 
         async restartGateway() {
-          await fetch('/api/gateway/restart', { method: 'POST' });
+          await fetch('/gateway/api/gateway/restart', { method: 'POST' });
           this.showToast('Gateway restarting', 'success');
           setTimeout(() => this.loadStatus(), 2000);
         },
@@ -592,8 +592,8 @@
         async loadPairing() {
           try {
             const [pendingRes, approvedRes] = await Promise.all([
-              fetch('/api/pairing/pending'),
-              fetch('/api/pairing/approved'),
+              fetch('/gateway/api/pairing/pending'),
+              fetch('/gateway/api/pairing/approved'),
             ]);
             if (pendingRes.ok) this.pendingUsers = (await pendingRes.json()).pending || [];
             if (approvedRes.ok) this.approvedUsers = (await approvedRes.json()).approved || [];
@@ -601,7 +601,7 @@
         },
 
         async approveUser(platform, code) {
-          const res = await fetch('/api/pairing/approve', {
+          const res = await fetch('/gateway/api/pairing/approve', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ platform, code }),
@@ -616,7 +616,7 @@
         },
 
         async denyUser(platform, code) {
-          const res = await fetch('/api/pairing/deny', {
+          const res = await fetch('/gateway/api/pairing/deny', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ platform, code }),
@@ -629,7 +629,7 @@
 
         async revokeUser(platform, user_id) {
           if (!confirm('Revoke access for this user?')) return;
-          const res = await fetch('/api/pairing/revoke', {
+          const res = await fetch('/gateway/api/pairing/revoke', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ platform, user_id }),

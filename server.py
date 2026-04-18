@@ -21,8 +21,9 @@ from starlette.middleware import Middleware
 from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse
-from starlette.routing import Route, Mount
+from starlette.routing import Route, Mount, WebSocketRoute
 from starlette.templating import Jinja2Templates
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 try:
     import aiohttp
@@ -51,6 +52,12 @@ CODE_TTL_SECONDS = 3600
 API_SERVER_HOST = os.environ.get("API_SERVER_HOST", "127.0.0.1")
 API_SERVER_PORT = os.environ.get("API_SERVER_PORT", "8642")
 API_SERVER_TARGET = f"http://{API_SERVER_HOST}:{API_SERVER_PORT}"
+
+# Mission Control dashboard (hermes dashboard) — same container, different port.
+DASHBOARD_HOST = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
+DASHBOARD_PORT = os.environ.get("DASHBOARD_PORT", "9119")
+DASHBOARD_TARGET = f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}"
+DASHBOARD_WS_TARGET = f"ws://{DASHBOARD_HOST}:{DASHBOARD_PORT}"
 
 # Registry of known Hermes env vars exposed in the UI.
 # Each entry: (key, label, category, is_password)
@@ -349,7 +356,12 @@ def _resolve_session_from_request(request: Request) -> str | None:
 class BasicAuthBackend(AuthenticationBackend):
     async def authenticate(self, conn):
         # Skip basic auth for /v1/* routes Ã¢ÂÂ they use Bearer token auth via Hermes API server
-        if conn.url.path.startswith("/v1/") or conn.url.path.startswith("/paperclip/"):
+        path = conn.url.path
+        if (
+            path.startswith("/v1/")
+            or path.startswith("/paperclip/")
+            or path == "/health"
+        ):
             return AuthCredentials(["authenticated"]), SimpleUser("api_client")
 
         if "Authorization" not in conn.headers:
@@ -655,6 +667,172 @@ async def v1_proxy(request: Request):
             {"error": f"Proxy error: {type(e).__name__}: {e}"},
             status_code=502,
         )
+
+
+# --- Mission Control dashboard reverse proxy (HTTP + WebSocket) ---
+# The `hermes dashboard` process runs in the same container on DASHBOARD_PORT
+# (default 9119). We proxy everything through the wrapper so the dashboard is
+# reachable at the public URL (behind Basic auth) without exposing a second
+# port. Binary-safe: response bodies are streamed as raw bytes.
+
+# Hop-by-hop headers that must NOT be forwarded between client and upstream
+# (RFC 7230 sec 6.1). Case-insensitive.
+_HOP_BY_HOP = frozenset({
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade",
+    # These are managed by aiohttp / Starlette; forwarding them corrupts the body.
+    "content-encoding", "content-length",
+    # Host must be set by the HTTP client for the upstream connection.
+    "host",
+})
+
+
+def _filter_headers(headers) -> dict[str, str]:
+    return {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP}
+
+
+async def dashboard_http_proxy(request: Request):
+    """Reverse-proxy HTTP requests to the Mission Control dashboard.
+
+    Streams raw bytes to preserve binary assets (JS bundles, images, fonts).
+    Basic auth is enforced upstream by AuthenticationMiddleware.
+    """
+    if not AIOHTTP_AVAILABLE:
+        return JSONResponse(
+            {"error": "aiohttp not installed - proxy unavailable"},
+            status_code=503,
+        )
+
+    path = request.url.path
+    target_url = f"{DASHBOARD_TARGET}{path}"
+    if request.url.query:
+        target_url += f"?{request.url.query}"
+
+    forward_headers = _filter_headers(request.headers)
+    body = await request.body()
+
+    try:
+        session = await _get_proxy_session()
+        resp = await session.request(
+            method=request.method,
+            url=target_url,
+            headers=forward_headers,
+            data=body if body else None,
+            allow_redirects=False,
+        )
+
+        resp_headers = _filter_headers(resp.headers)
+        content_type = resp.headers.get("content-type", "application/octet-stream")
+
+        async def stream_generator():
+            try:
+                async for chunk in resp.content.iter_any():
+                    yield chunk
+            finally:
+                resp.release()
+
+        return StreamingResponse(
+            stream_generator(),
+            status_code=resp.status,
+            headers=resp_headers,
+            media_type=content_type,
+        )
+    except aiohttp.ClientConnectorError:
+        return JSONResponse(
+            {"error": "Dashboard not reachable - it may still be starting"},
+            status_code=503,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            {"error": "Dashboard request timed out"},
+            status_code=504,
+        )
+    except Exception as e:
+        return JSONResponse(
+            {"error": f"Dashboard proxy error: {type(e).__name__}: {e}"},
+            status_code=502,
+        )
+
+
+async def dashboard_ws_proxy(websocket: WebSocket):
+    """Bidirectional WebSocket relay for the dashboard.
+
+    Basic auth is enforced by AuthenticationMiddleware before this handler runs.
+    """
+    if not AIOHTTP_AVAILABLE:
+        await websocket.close(code=1011, reason="aiohttp unavailable")
+        return
+
+    await websocket.accept()
+
+    path = websocket.url.path
+    target_url = f"{DASHBOARD_WS_TARGET}{path}"
+    if websocket.url.query:
+        target_url += f"?{websocket.url.query}"
+
+    # Forward only safe headers to the upstream WS handshake.
+    forward_headers = {}
+    for key in ("cookie", "authorization", "x-forwarded-for", "x-forwarded-proto"):
+        val = websocket.headers.get(key)
+        if val:
+            forward_headers[key] = val
+
+    try:
+        session = await _get_proxy_session()
+        async with session.ws_connect(target_url, headers=forward_headers) as upstream:
+
+            async def forward_client_to_server():
+                try:
+                    while True:
+                        msg = await websocket.receive()
+                        if msg["type"] == "websocket.disconnect":
+                            await upstream.close()
+                            break
+                        if msg.get("text") is not None:
+                            await upstream.send_str(msg["text"])
+                        elif msg.get("bytes") is not None:
+                            await upstream.send_bytes(msg["bytes"])
+                except WebSocketDisconnect:
+                    await upstream.close()
+                except Exception as e:
+                    print(f"[dashboard-ws] client->server: {type(e).__name__}: {e}")
+                    await upstream.close()
+
+            async def forward_server_to_client():
+                try:
+                    async for msg in upstream:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            await websocket.send_text(msg.data)
+                        elif msg.type == aiohttp.WSMsgType.BINARY:
+                            await websocket.send_bytes(msg.data)
+                        elif msg.type in (aiohttp.WSMsgType.CLOSE,
+                                           aiohttp.WSMsgType.CLOSED,
+                                           aiohttp.WSMsgType.ERROR):
+                            break
+                except Exception as e:
+                    print(f"[dashboard-ws] server->client: {type(e).__name__}: {e}")
+                finally:
+                    try:
+                        await websocket.close()
+                    except Exception:
+                        pass
+
+            await asyncio.gather(
+                forward_client_to_server(),
+                forward_server_to_client(),
+                return_exceptions=True,
+            )
+    except aiohttp.ClientConnectorError:
+        try:
+            await websocket.close(code=1011, reason="Dashboard not reachable")
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[dashboard-ws] setup error: {type(e).__name__}: {e}")
+        try:
+            await websocket.close(code=1011, reason="Upstream error")
+        except Exception:
+            pass
 
 
 # Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂ End Proxy Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
@@ -1100,27 +1278,43 @@ async def auto_start_gateway():
 
 
 routes = [
-    Route("/", homepage),
+    # --- Public / Bearer-auth endpoints (must come before the catch-all) ---
     Route("/health", health),
-    Route("/api/config", api_config_get, methods=["GET"]),
-    Route("/api/config", api_config_put, methods=["PUT"]),
-    Route("/api/status", api_status),
-    Route("/api/logs", api_logs),
-    Route("/api/gateway/start", api_gateway_start, methods=["POST"]),
-    Route("/api/gateway/stop", api_gateway_stop, methods=["POST"]),
-    Route("/api/gateway/restart", api_gateway_restart, methods=["POST"]),
-    Route("/api/pairing/pending", api_pairing_pending),
-    Route("/api/pairing/approve", api_pairing_approve, methods=["POST"]),
-    Route("/api/pairing/deny", api_pairing_deny, methods=["POST"]),
-    Route("/api/pairing/approved", api_pairing_approved),
-    Route("/api/pairing/revoke", api_pairing_revoke, methods=["POST"]),
-    Route("/api/sessions", api_sessions_list, methods=["GET"]),
-    Route("/api/sessions", api_sessions_create, methods=["POST"]),
-    Route("/api/sessions/delete", api_sessions_delete, methods=["POST"]),
     # Paperclip translation endpoint (no basic auth)
     Route("/paperclip/invoke", paperclip_invoke, methods=["POST"]),
-        # Reverse proxy: /v1/* Ã¢ÂÂ Hermes API server (no basic auth Ã¢ÂÂ uses Bearer token)
+    # Reverse proxy: /v1/* -> Hermes API server (no basic auth - uses Bearer token)
     Route("/v1/{path:path}", v1_proxy, methods=["GET", "POST", "PUT", "DELETE", "PATCH"]),
+
+    # --- Wrapper UI + its API, namespaced under /gateway/* to avoid
+    #     colliding with Mission Control's own /api/* endpoints. ---
+    Route("/gateway", homepage),
+    Route("/gateway/", homepage),
+    Route("/gateway/api/config", api_config_get, methods=["GET"]),
+    Route("/gateway/api/config", api_config_put, methods=["PUT"]),
+    Route("/gateway/api/status", api_status),
+    Route("/gateway/api/logs", api_logs),
+    Route("/gateway/api/gateway/start", api_gateway_start, methods=["POST"]),
+    Route("/gateway/api/gateway/stop", api_gateway_stop, methods=["POST"]),
+    Route("/gateway/api/gateway/restart", api_gateway_restart, methods=["POST"]),
+    Route("/gateway/api/pairing/pending", api_pairing_pending),
+    Route("/gateway/api/pairing/approve", api_pairing_approve, methods=["POST"]),
+    Route("/gateway/api/pairing/deny", api_pairing_deny, methods=["POST"]),
+    Route("/gateway/api/pairing/approved", api_pairing_approved),
+    Route("/gateway/api/pairing/revoke", api_pairing_revoke, methods=["POST"]),
+    Route("/gateway/api/sessions", api_sessions_list, methods=["GET"]),
+    Route("/gateway/api/sessions", api_sessions_create, methods=["POST"]),
+    Route("/gateway/api/sessions/delete", api_sessions_delete, methods=["POST"]),
+
+    # --- Catch-all: everything else reverse-proxies to the Mission Control
+    #     dashboard running on DASHBOARD_PORT inside the same container.
+    #     WebSocket upgrades are routed here first (scope type=websocket),
+    #     every other method falls through to the HTTP proxy below. ---
+    WebSocketRoute("/{path:path}", dashboard_ws_proxy),
+    Route(
+        "/{path:path}",
+        dashboard_http_proxy,
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
+    ),
 ]
 
 @asynccontextmanager
