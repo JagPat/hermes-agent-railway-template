@@ -9,10 +9,16 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
+# Clone hermes-agent, install Python deps, and pre-build the React frontend.
+# `hermes dashboard` falls back to an at-startup `npm install + npm run build`
+# if web_dist/ is missing — that runtime build is unreliable (network flakes,
+# ephemeral /tmp, disk pressure) and has already broken the dashboard on
+# redeploy. Baking the build into the image makes container start deterministic.
 RUN git clone --depth 1 --branch v2026.4.16 https://github.com/NousResearch/hermes-agent.git /tmp/hermes-agent && \
     cd /tmp/hermes-agent && \
     uv pip install --system --no-cache -e ".[all,web]" && \
-    rm -rf /tmp/hermes-agent/.git
+    cd web && npm ci && npm run build && \
+    rm -rf /tmp/hermes-agent/.git /tmp/hermes-agent/web/node_modules
 
 COPY requirements.txt /app/requirements.txt
 RUN uv pip install --system --no-cache -r /app/requirements.txt
