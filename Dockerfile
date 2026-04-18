@@ -9,7 +9,15 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
-# Clone hermes-agent, install Python deps, and pre-build the React frontend.
+# Hermes source: JagPat/chanakya-hermes @ fc64deb (Apr 2026) instead of
+# upstream NousResearch/hermes-agent @ v2026.4.16. The fork is ~25 commits
+# ahead of v2026.4.16 (the latest upstream tag) and carries:
+#   - untagged upstream fixes: Discord/DingTalk/Weixin/cron regressions
+#   - 5 Chanakya-specific commits: cli-config.chanakya.yaml profile,
+#     the v0.10.0 web dashboard build step, entrypoint config-seeding
+# Our wrapper (server.py / start.sh / templates / memory / skills) keeps
+# driving the container, so the fork's own Dockerfile/entrypoint/CMD are
+# ignored — we only consume its installed `hermes` Python package.
 #
 # Bake the frontend build into the image so container start is deterministic.
 # Two things must be true at runtime for `hermes dashboard` to serve the UI:
@@ -18,15 +26,18 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
 #      reads from — Path(__file__).parent / "web_dist").
 #   2. /tmp/hermes-agent/web/package.json must NOT exist. Reason: cmd_dashboard
 #      unconditionally calls _build_web_ui(PROJECT_ROOT / "web", fatal=True),
-#      which early-returns only when web/package.json is absent (main.py:3239).
-#      When it runs, Vite's emptyOutDir=true wipes the baked web_dist first,
-#      then npm install fails in the slim runtime (no build toolchain), so
-#      the dashboard never comes up on 9119.
+#      which early-returns only when web/package.json is absent
+#      (hermes_cli/main.py:3311 in the fork). When it runs, Vite's
+#      emptyOutDir=true wipes the baked web_dist first, then npm install
+#      fails in the slim runtime (no build toolchain), so the dashboard
+#      never comes up on 9119.
 #
 # Therefore: after building, we drop the whole web/ source tree. The compiled
 # output under hermes_cli/web_dist/ is what the server serves.
-RUN git clone --depth 1 --branch v2026.4.16 https://github.com/NousResearch/hermes-agent.git /tmp/hermes-agent && \
+ARG CHANAKYA_HERMES_REF=fc64debe7e961e867e67feb5579cd825d3100a91
+RUN git clone https://github.com/JagPat/chanakya-hermes.git /tmp/hermes-agent && \
     cd /tmp/hermes-agent && \
+    git checkout ${CHANAKYA_HERMES_REF} && \
     uv pip install --system --no-cache -e ".[all,web]" && \
     cd web && npm ci && npm run build && \
     rm -rf /tmp/hermes-agent/.git /tmp/hermes-agent/web
